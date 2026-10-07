@@ -1,0 +1,80 @@
+vim.opt.rtp:append(vim.fn.getcwd())
+local Lease = require("rime_toggle.lease")
+local root = vim.fn.tempname()
+local context = string.rep("a", 32)
+local store = assert(Lease.new(root))
+local count = 0
+local function check(name, run)
+  local ok, err = pcall(run)
+  assert(ok, name .. ": " .. tostring(err))
+  count = count + 1
+  print("PASS " .. name)
+end
+
+local ok, err = pcall(function()
+  check("ownership survives a new store instance", function()
+    assert(store:with_lock(context, function(record)
+      assert(record:read() == nil)
+      return record:write({ owner = "first" })
+    end))
+    local other = assert(Lease.new(root))
+    assert(other:with_lock(context, function(record)
+      assert(record:read().owner == "first")
+      return record:write({ owner = "second" })
+    end))
+    assert(store:with_lock(context, function(record)
+      assert(record:read().owner == "second")
+      return record:clear()
+    end))
+  end)
+
+  check("contended lock cannot enter the state mutation callback", function()
+    local other = assert(Lease.new(root))
+    assert(store:with_lock(context, function()
+      local entered = false
+      local locked, why = other:with_lock(context, function()
+        entered = true
+      end)
+      assert(not locked and why == "lease lock busy" and not entered)
+      return true
+    end))
+  end)
+
+  check("callback exception releases its lock", function()
+    local result, why = store:with_lock(context, function()
+      error("intentional failure")
+    end)
+    assert(not result and why:find("intentional failure", 1, true))
+    assert(store:with_lock(context, function(record)
+      return record:write({ owner = "after-exception" })
+    end))
+  end)
+
+  check("record access cannot escape the lock", function()
+    local saved
+    assert(store:with_lock(context, function(record)
+      saved = record
+      return true
+    end))
+    assert(not saved:write({ owner = "outside-lock" }))
+    assert(store:with_lock(context, function(record)
+      assert(record:read().owner == "after-exception")
+      return record:clear()
+    end))
+  end)
+
+  check("truncated records are surfaced rather than overwritten", function()
+    vim.fn.writefile({ '{"owner":' }, root .. "/" .. context .. ".json")
+    assert(store:with_lock(context, function(record)
+      local value, why = record:read()
+      assert(value == nil and why:find("corrupt lease record", 1, true))
+      assert(not record:write({ owner = "replacement" }))
+      assert(not record:clear())
+      return true
+    end))
+    assert(vim.fn.readfile(root .. "/" .. context .. ".json")[1] == '{"owner":')
+  end)
+end)
+vim.fn.delete(root, "rf")
+assert(ok, err)
+print(string.format("%d lease regressions passed", count))
